@@ -15,7 +15,7 @@ import requests
 from PIL import Image
 from io import BytesIO
 from transformers import TextStreamer
-
+from tqdm import tqdm
 
 def load_image(image_file):
     if image_file.startswith('http://') or image_file.startswith('https://'):
@@ -24,7 +24,6 @@ def load_image(image_file):
     else:
         image = Image.open(image_file).convert('RGB')
     return image
-
 
 def main(args):
     # Model
@@ -51,77 +50,79 @@ def main(args):
     else:
         args.conv_mode = conv_mode
 
-
     data = pd.read_csv(args.csv_file)
-    answers = []
+    answers = [None] * len(data)
+    batch_size = args.batch_size
 
-    for index, row in data.iterrows():
-        image_path = os.path.join(args.image_folder, row['Path'])
-        question = row['Questions']
+    # Split data into batches
+    num_batches = (len(data) + batch_size - 1) // batch_size
+    
+    for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+        batch_data = data[batch_idx * batch_size:(batch_idx + 1) * batch_size]
 
-        if not os.path.exists(image_path):
-            print(f"Warning: Image {row['Path']} not found.")
-            answers.append("")
-            continue
+        # Process each sample individually
+        for index, row in batch_data.iterrows():
+            image_path = os.path.join(args.image_folder, row['Path'])
+            question = row['Questions']
 
-        image = load_image(image_path)
-        image_size = image.size
-        image_tensor = process_images([image], image_processor, model.config)
-        if type(image_tensor) is list:
-            image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
-        else:
-            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
-
-        conv = conv_templates[args.conv_mode].copy()
-        if "mpt" in model_name.lower():
-            roles = ('user', 'assistant')
-        else:
-            roles = conv.roles
-
-        print(f"{roles[0]}: {question}")
-
-        if model.config.mm_use_im_start_end:
-            inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + question
-        else:
-            inp = DEFAULT_IMAGE_TOKEN + '\n' + question
-
-        conv.append_message(conv.roles[0], inp)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-
-        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
-        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-        with torch.no_grad(): 
-            try:
-                output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor, 
-                    image_sizes=[image_size], 
-                    do_sample=True if args.temperature > 0 else False,
-                    temperature=args.temperature,
-                    max_new_tokens=args.max_new_tokens,
-                    streamer=streamer,
-                    use_cache=True)
-            except RuntimeError as e:
-                print(f"RuntimeError during generation: {e}")
-                answers.append("Error during generation")
+            if not os.path.exists(image_path):
+                print(f"Warning: Image {row['Path']} not found.")
+                answers[index] = ""
                 continue
 
-        outputs = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-        conv.messages[-1][-1] = outputs
+            # Load image
+            image = load_image(image_path)
+            image_tensor = process_images([image], image_processor, model.config)
+            if type(image_tensor) is list:
+                image_tensor = image_tensor[0].to(model.device, dtype=torch.float16)
+            else:
+                image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
-        if args.debug:
-            print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
+            # Prepare prompt
+            conv = conv_templates[args.conv_mode].copy()
+            if "mpt" in model_name.lower():
+                roles = ('user', 'assistant')
+            else:
+                roles = conv.roles
 
-        answers.append(outputs)
+            if model.config.mm_use_im_start_end:
+                inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + question
+            else:
+                inp = DEFAULT_IMAGE_TOKEN + '\n' + question
+
+            conv.append_message(conv.roles[0], inp)
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
+
+            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(model.device)
+
+            with torch.no_grad():
+                try:
+                    output_ids = model.generate(
+                        input_ids,
+                        images=image_tensor.unsqueeze(0),
+                        image_sizes=[image.size],
+                        do_sample=True if args.temperature > 0 else False,
+                        temperature=args.temperature,
+                        max_new_tokens=args.max_new_tokens,
+                        use_cache=True
+                    )
+                except RuntimeError as e:
+                    print(f"RuntimeError during generation: {e}")
+                    answers[index] = "Error during generation"
+                    continue
+
+            # Decode output and store answer
+            outputs = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+            answers[index] = outputs
+
+            if args.debug:
+                print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
 
     # Save answers back to CSV
     data['Answers'] = answers
     data.to_csv(args.csv_file, index=False)
     print(f"Answers saved to {args.csv_file}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -136,5 +137,6 @@ if __name__ == "__main__":
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=4, help="Number of samples to read in a batch")
     args = parser.parse_args()
     main(args)
